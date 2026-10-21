@@ -1,0 +1,21 @@
+{
+  "token": "",
+  "base_url": "https://yzsxg.fzu.edu.cn/livecloud/project/fzu/attn/",
+  "sso_username": "在这里填你的学号",
+  "sso_password": "在这里填你的信息门户密码",
+  "lon": 119.195397,
+  "lat": 26.060246,
+  "address": "福建省福州市闽侯县上街镇福州大学(旗山校区)",
+  "ca_is_no": "0",
+  "poll_interval": 300,
+  "jitter_meters": 30,
+  "warmup_checks": 2,
+  "clockin_delay_range": [30, 180],
+  "max_wait_minutes": 120,
+  "submit_retries": 8,
+  "in_window_poll_interval": 60,
+  "glm_api_key": "（可选）智谱开放平台 key，用于 AI 自动处置，没有可留空",
+  "notify_channel": "email",
+  "notify_key": "（可选）smtp主机|端口|发件邮箱|授权码|收件邮箱，如 smtp.qq.com|465|xxx@qq.com|xxxx16位授权码|xxx@qq.com",
+  "user_agent": "（可选）自定义 UA，一般留空"
+}

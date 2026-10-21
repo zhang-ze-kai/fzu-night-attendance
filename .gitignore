@@ -1,0 +1,31 @@
+# 凭据与会话（绝不入库）
+accounts/*/
+!accounts/你的学号/
+accounts/你的学号/config.json
+accounts/你的学号/sso_session.json
+accounts/你的学号/sms_code.txt
+accounts/你的学号/*.log
+accounts/你的学号/bootstrap_status.json
+accounts/你的学号/bs_*.png
+accounts/你的学号/bs_*.html
+notify.json
+*.log
+*.token
+
+# Python
+__pycache__/
+*.pyc
+venv/
+
+# 逆向产物（如存在）
+apk/
+extracted/
+*.so
+page_bundle.js
+cas-main.js
+libapp_strings.txt
+debug_post.html
+
+# 系统
+.DS_Store
+Thumbs.db
