@@ -58,6 +58,7 @@ def run_account(acc_dir, dry_run=False, once=False):
     notified_fail = False  # 失败邮件只发一次
     notified_manual = False  # 22:00 手动处理提醒只发一次
     last_fail_reason = ""
+    doctor_done = False    # 代码医生每轮运行最多介入一次
     last_err = ""
 
     while True:
@@ -112,6 +113,50 @@ def run_account(acc_dir, dry_run=False, once=False):
                     loga(f"[AI 处置异常] {ae}")
 
             time.sleep(60 if err_streak > 1 else 30)
+
+        # 代码医生：运维修复与 AI 白名单决策都无法解决时，AI 接入代码级诊断/修补
+        # 触发条件：STATE_FAIL 持续且白名单决策已用尽，或异常持续且已 AI 介入过
+        doctor_trigger = ((state == STATE_FAIL and ai_rounds >= 3) or
+                          (state == STATE_WAIT and err_streak >= 3 and ai_marked))
+        if doctor_trigger and not doctor_done:
+            doctor_done = True
+            loga("[代码医生] 运维修复未奏效，AI 接入代码级诊断…")
+            try:
+                from code_doctor import diagnose_and_maybe_patch
+                lr = getattr(client, "last_response", None) or {}
+                res = diagnose_and_maybe_patch(
+                    f"账号{acc_dir.name}签到持续失败",
+                    {"last_response": lr, "last_fail_reason": last_fail_reason,
+                     "error_history": last_err[:300], "account": acc_dir.name,
+                     "server_time": time.strftime("%Y-%m-%d %H:%M")},
+                    failing_action=(lr or {}).get("action", "check.action"),
+                    api_key=cfg.get("glm_api_key"),
+                    app_dir=str(BASE_DIR),
+                    dry_run=dry_run)
+                loga(f"[代码医生] patched={res.get('patched')} "
+                     f"rolled_back={res.get('rolled_back')} | {res.get('notify_text')[:260]}")
+                notify_account_issue(acc_dir, cfg,
+                                     "自动修复升级至代码级： " + res.get("notify_text", "")[:200],
+                                     res.get("diagnosis", "")[:300])
+                if res.get("patched") and not dry_run:
+                    # 补丁热生效：重载模块 + 重建客户端，继续窗口内重试
+                    import importlib
+                    import checkin as _ck
+                    importlib.reload(_ck)
+                    globals().update({
+                        "run_once": _ck.run_once, "AttnClient": _ck.AttnClient,
+                        "STATE_DONE": _ck.STATE_DONE, "STATE_WAIT": _ck.STATE_WAIT,
+                        "STATE_FAIL": _ck.STATE_FAIL, "STATE_ABORT": _ck.STATE_ABORT,
+                        "sso_cookie_refresh": _ck.sso_cookie_refresh,
+                        "sso_refresh": _ck.sso_refresh})
+                    client = _ck.AttnClient(cfg.get("token"), cfg.get("base_url"),
+                                            user_agent=cfg.get("user_agent"))
+                    err_streak = 0
+                    loga("[代码医生] 补丁已热生效，继续窗口内重试")
+                    continue
+            except Exception as de:
+                loga(f"[代码医生异常] {de}")
+                notify_account_issue(acc_dir, cfg, "代码医生自身出错: " + str(de)[:200], "")
 
         if state == STATE_DONE:
             return True
