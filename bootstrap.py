@@ -96,24 +96,39 @@ def main():
             status(step="错误", error="找不到登录按钮")
             sys.exit(1)
 
-        # 等待响应：成功→切到 smsLogin 页（SPA 无跳转）；失败→错误提示
-        time.sleep(5)
+        # 等待登录去向（最长 45s）：
+        #   A. 直接完成整条链 → URL 出现 index.action?token= → 无需短信，保存会话即成功
+        #   B. 出现「获取验证码」→ 短信 2FA 流程
+        #   C. 超时/报错 → 按失败处理
+        landed_token, sms_mode = None, False
+        dl = time.time() + 45
+        while time.time() < dl:
+            url = page.url
+            if "token=" in url:
+                landed_token = url.split("token=")[1].split("&")[0]
+                break
+            if page.query_selector("text=获取验证码"):
+                sms_mode = True
+                break
+            time.sleep(2)
         shot(page, "02_after_submit")
 
-        # 找「获取验证码」按钮（smsLogin 页标志）
-        code_btn = None
-        for sel in ["button:has-text('获取验证码')", "span:has-text('获取验证码')",
-                    "*:has-text('获取验证码')"]:
-            try:
-                page.wait_for_selector(sel, timeout=15000)
-                code_btn = page.query_selector(sel)
-                break
-            except Exception:
-                continue
-        if not code_btn:
-            status(step="错误", error="未进入短信验证页（密码可能错误或页面变化）")
+        if landed_token:
+            cookies = ctx.cookies()
+            (BASE / "sso_session.json").write_text(
+                json.dumps(cookies, ensure_ascii=False, indent=1), encoding="utf-8")
+            cfg["token"] = landed_token
+            (BASE / "config.json").write_text(
+                json.dumps(cfg, ensure_ascii=False, indent=2), encoding="utf-8")
+            status(phase="done", msg="登录完成（未触发短信 2FA），会话与 token 已保存",
+                   token_prefix=landed_token[:14], cookies=len(cookies))
+            browser.close()
+            return
+        if not sms_mode:
+            status(step="错误", error="点击登录后未进入短信页也未完成跳转（密码可能错误或页面变化），详见截图")
             sys.exit(2)
         status(step="短信验证页已出现，点击获取验证码")
+        code_btn = page.query_selector("text=获取验证码")
         code_btn.click()
         status(phase="sms_sent", msg="短信已发送，等待验证码写入 sms_code.txt")
         shot(page, "03_sms_sent")

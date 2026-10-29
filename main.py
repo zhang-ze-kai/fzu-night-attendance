@@ -205,13 +205,16 @@ def main():
         except Exception:
             traceback.print_exc()
             fail.append(d.name)
-        # 账号间随机间隔 3-8 分钟（防同 IP 同步行为特征）
-        if d != dirs[-1]:
+        # 账号间随机间隔 3-8 分钟（防同 IP 同步行为特征）；--once 快速模式跳过
+        if d != dirs[-1] and not args.once:
             gap = random.uniform(180, 480)
             log(f"账号间隔 {gap:.0f}s 后处理下一个\n")
             time.sleep(gap)
 
     log(f"===== 汇总: 成功 {len(ok)} {ok} / 失败 {len(fail)} {fail} =====")
+    if args.dry_run:
+        log("dry-run 模式不推送通知")
+        sys.exit(0 if not fail else 1)
     try:
         from notifier import push, load_notify_config
         ch, key = load_notify_config(str(BASE_DIR))
