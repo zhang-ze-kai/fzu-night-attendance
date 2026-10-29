@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """值守 AI 助手：突发情况时把脱敏现场发给 GLM，取回诊断与白名单处置决策。"""
+from pathlib import Path
 import json
 import re
 
@@ -28,13 +29,28 @@ _calls = 0  # 每次脚本运行 ai_help 最多调用 2 次
 
 
 def _load_key(api_key=None):
+    """key 查找顺序：显式传入 → cwd config.json → 脚本目录 config.json
+    → 脚本目录 accounts/*/config.json（多人版根目录已无 config.json 的回退）。"""
     if api_key:
         return api_key
-    try:
-        cfg = json.load(open("config.json", encoding="utf-8"))
-        return cfg.get("glm_api_key")
-    except Exception:
-        return None
+    here = Path(__file__).resolve().parent
+    for cand in [Path("config.json"), here / "config.json"]:
+        try:
+            k = json.loads(cand.read_text(encoding="utf-8")).get("glm_api_key")
+            if k:
+                return k
+        except Exception:
+            continue
+    if (here / "accounts").exists():
+        for d in sorted((here / "accounts").iterdir()):
+            f = d / "config.json"
+            try:
+                k = json.loads(f.read_text(encoding="utf-8")).get("glm_api_key")
+                if k:
+                    return k
+            except Exception:
+                continue
+    return None
 
 
 def _chat(messages, timeout=30, max_tokens=1024):

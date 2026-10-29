@@ -93,7 +93,9 @@ def run_account(acc_dir, dry_run=False, once=False):
                     act, reason = ai_decide(
                         f"账号{acc_dir.name}签到连续异常",
                         {"error_history": last_err[:400], "streak": err_streak,
-                         "relogins_done": relogins, "ai_round": ai_rounds})
+                         "relogins_done": relogins, "ai_round": ai_rounds},
+                        api_key=cfg.get("glm_api_key"))
+                    loga(f"[AI 决策#{ai_rounds}] {act} — {reason}")
                     loga(f"[AI 决策#{ai_rounds}] {act} — {reason}")
                     if act == "renew_session" and relogins < 3:
                         relogins += 1
@@ -126,7 +128,7 @@ def run_account(acc_dir, dry_run=False, once=False):
                     from ai_assist import ai_decide
                     act, reason = ai_decide(f"账号{acc_dir.name}签到失败", {
                         "reason": last_fail_reason, "relogins_done": relogins,
-                        "ai_round": ai_rounds})
+                        "ai_round": ai_rounds}, api_key=cfg.get("glm_api_key"))
                     loga(f"[AI 决策#{ai_rounds}] {act} — {reason}")
                     if act == "renew_session" and relogins < 3:
                         relogins += 1
