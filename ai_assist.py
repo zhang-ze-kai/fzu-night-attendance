@@ -22,8 +22,11 @@ DECIDE_SYSTEM = """你是签到脚本的值守 AI。脚本遇到异常时，你�
 可用动作：
 - renew_session: 重新用会话 cookie 换 token（适用于 token 失效/401/非 JSON 响应；cookie 已失效时无效）
 - keep_waiting: 维持当前重试节奏（适用于服务器抖动/高峰拥堵/连接重置等瞬时故障）
-- escalate: 超出脚本能力（如需短信验证码、代码级 bug、围栏配置问题），通知人工处理
-只返回 JSON（不要其他文字）: {"action": "renew_session|keep_waiting|escalate", "reason": "一句话理由"}"""
+- ask_human: 需要用户提供信息时（如短信验证码、二选一决策），把问题写在 question 字段，
+  系统会通过邮件向用户提问并等待回复，你的下一轮决策会收到用户的回答
+- escalate: 超出脚本能力且无需向用户索取信息（代码级 bug、围栏配置问题），通知人工处理
+只返回 JSON（不要其他文字）:
+{"action": "renew_session|keep_waiting|ask_human|escalate", "reason": "一句话理由", "question": "仅 ask_human 时填写"}"""
 
 _calls = 0  # 每次脚本运行 ai_help 最多调用 2 次
 
@@ -101,8 +104,8 @@ def ai_decide(issue, context=None, timeout=30):
         if m:
             d = json.loads(m.group(0))
             act = d.get("action")
-            if act in ("renew_session", "keep_waiting", "escalate"):
-                return act, d.get("reason", "")
+            if act in ("renew_session", "keep_waiting", "ask_human", "escalate"):
+                return act, d.get("reason", "") or d.get("question", "")
         return None, text[-300:]
     except Exception as e:
         return None, f"AI 决策失败: {type(e).__name__}: {e}"

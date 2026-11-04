@@ -25,8 +25,9 @@ except ImportError:
 # 可移植路径：accounts/<学号>/ 相对于本脚本所在目录
 APP_DIR = Path(__file__).resolve().parent
 if len(sys.argv) < 2:
-    sys.exit("用法: python bootstrap.py <学号>  （账号目录 accounts/<学号>/ 需已建好 config.json）")
+    sys.exit("用法: python bootstrap.py <学号> [等待验证码秒数，默认300]  （账号目录 accounts/<学号>/ 需已建好 config.json）")
 ACC = sys.argv[1]
+WAIT_S = int(sys.argv[2]) if len(sys.argv) > 2 else 300
 BASE = APP_DIR / "accounts" / ACC
 if not (BASE / "config.json").exists():
     sys.exit(f"账号目录不存在: {BASE}（请先建 config.json）")
@@ -135,7 +136,7 @@ def main():
 
         # 轮询等待验证码（最多 5 分钟）
         code = None
-        deadline = time.time() + 300
+        deadline = time.time() + WAIT_S
         while time.time() < deadline:
             f = BASE / "sms_code.txt"
             if f.exists():

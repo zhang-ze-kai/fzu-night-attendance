@@ -8,13 +8,18 @@
   main.py                          本文件：遍历 accounts/ 逐个签到
 
 每账号流程：现有 token → 失效用 cookie 免密续期 → 再失效密码登录
-（新环境首次登录会要求短信 2FA，账号主人跑一次 bootstrap.py 报码即长期免密）。
-异常时值守 AI 自动决策（白名单动作：换会话/继续等待/上报人工），上下文逐轮滚动。
+（新环境首次登录可能触发短信 2FA → **邮箱双向通道**：系统发请求邮件，用户直接回复
+验证码，脚本读回复后继续自治，无需打开电脑）。
+异常时值守 AI 多轮决策（换会话/等待/向用户提问/上报），持续失败升级代码医生
+（AI 代码级诊断 + 函数级补丁热生效）。
 """
 
 import argparse
+import importlib
 import json
 import random
+import re
+import subprocess
 import sys
 import time
 import traceback
@@ -38,6 +43,27 @@ def account_dirs(pattern=None):
     return dirs
 
 
+def mailbox_roundtrip(acc_dir, base_dir, question, deadline, max_wait_s=1500):
+    """邮箱双向通道：发请求邮件 → 轮询用户回复。返回回复文本或 None。"""
+    from mailbox import load_notify, request_and_wait
+    ncfg = load_notify(str(base_dir))
+    if not ncfg:
+        log("[邮箱通道] notify.json 未配置，无法向用户提问")
+        return None
+    remaining = deadline - time.time() - 600
+    if remaining < 120:
+        log(f"[邮箱通道] 窗口/时限剩余不足（{int(remaining)}s），放弃提问")
+        return None
+    marker = f"FDU-RQ-{acc_dir}-{int(time.time())}"
+    timeout_s = int(min(max_wait_s, remaining))
+    log(f"[邮箱通道] 请求邮件已发送，等待用户回复（最长 {timeout_s}s）…")
+    r = request_and_wait(ncfg, marker, question, timeout_s=timeout_s, poll_s=25,
+                         deadline_ts=deadline - 300)
+    reply = (r.get("answer") or "").strip()
+    log("[邮箱通道] " + ("收到回复: " + reply[:80] if reply else "超时未收到回复"))
+    return reply or None
+
+
 def run_account(acc_dir, dry_run=False, once=False):
     """跑单个账号的完整签到循环。返回 True=已签到/成功，False=失败。"""
     cfg_path = acc_dir / "config.json"
@@ -54,11 +80,11 @@ def run_account(acc_dir, dry_run=False, once=False):
 
     deadline = time.time() + int(cfg.get("max_wait_minutes", 120)) * 60
     relogins, err_streak = 0, 0
-    ai_rounds = 0          # AI 自主处置轮数（最多 3）
-    notified_fail = False  # 失败邮件只发一次
+    ai_rounds = 0            # AI 白名单决策轮数（最多 3，之后升级代码医生）
+    asked_human = False      # AI 向用户提问（邮件往返）最多一次
+    doctor_done = False      # 代码医生每轮运行最多介入一次
+    notified_fail = False    # 失败邮件只发一次
     notified_manual = False  # 22:00 手动处理提醒只发一次
-    last_fail_reason = ""
-    doctor_done = False    # 代码医生每轮运行最多介入一次
     last_err = ""
 
     while True:
@@ -76,8 +102,31 @@ def run_account(acc_dir, dry_run=False, once=False):
                     continue
                 except Exception as e2:
                     loga(f"续期失败: {e2}")
-                    ai_advice(acc_dir, cfg, f"token 续期失败退出: {e2}")
-                    notify_account_issue(acc_dir, cfg, f"token 续期失败: {e2}", "需人工重跑 bootstrap.py 报短信码")
+                    # 邮箱双向通道：短信墙 → 请求邮件 → 用户回复验证码 → 继续自治
+                    if "短信二次认证" in str(e2):
+                        code_reply = mailbox_roundtrip(
+                            acc_dir.name, BASE_DIR,
+                            f"账号 {acc_dir.name} 需要短信验证码：请回复本邮件，第一行写你手机收到的验证码。",
+                            deadline, max_wait_s=1800)
+                        if code_reply:
+                            m = re.search(r"(\d{4,8})", code_reply.replace(" ", ""))
+                            if m:
+                                (acc_dir / "sms_code.txt").write_text(m.group(1), encoding="utf-8")
+                                loga(f"[邮箱通道] 收到验证码 {m.group(1)}，运行引导…")
+                                subprocess.run([sys.executable, str(BASE_DIR / "bootstrap.py"),
+                                                acc_dir.name, "1800"], cwd=str(BASE_DIR),
+                                               timeout=2600)
+                                loga("[邮箱通道] 引导完成，重新续期…")
+                                nt = sso_cookie_refresh(cfg, str(cfg_path)) or sso_refresh(cfg, str(cfg_path))
+                                client = AttnClient(nt, cfg.get("base_url"), user_agent=cfg.get("user_agent"))
+                                notified_fail = False
+                                continue
+                        loga("[邮箱通道] 未完成验证（超时/格式不对），转人工")
+                        notify_account_issue(acc_dir, cfg,
+                                             f"短信验证邮件往返未成功: {str(e2)[:200]}",
+                                             "请手动打开 App 签到（22:30 前不算迟到），或重跑 bootstrap.py")
+                        return False
+                    notify_account_issue(acc_dir, cfg, f"token 续期失败: {e2}", "需人工处理")
                     return False
             last_err = f"{type(e).__name__}: {msg}"
             loga(f"异常: {msg}")
@@ -86,7 +135,7 @@ def run_account(acc_dir, dry_run=False, once=False):
             if once:
                 return False
 
-            # AI 自主处置循环（最多 3 轮，每轮带滚动上下文）
+            # AI 白名单决策（最多 3 轮）
             if err_streak >= 2 and ai_rounds < 3:
                 ai_rounds += 1
                 try:
@@ -97,7 +146,6 @@ def run_account(acc_dir, dry_run=False, once=False):
                          "relogins_done": relogins, "ai_round": ai_rounds},
                         api_key=cfg.get("glm_api_key"))
                     loga(f"[AI 决策#{ai_rounds}] {act} — {reason}")
-                    loga(f"[AI 决策#{ai_rounds}] {act} — {reason}")
                     if act == "renew_session" and relogins < 3:
                         relogins += 1
                         nt = sso_cookie_refresh(cfg, str(cfg_path)) or sso_refresh(cfg, str(cfg_path))
@@ -106,6 +154,14 @@ def run_account(acc_dir, dry_run=False, once=False):
                             loga("[AI 处置] 已换新 token，下一轮重试")
                             continue
                         loga("[AI 处置] 续期未成功")
+                    elif act == "ask_human" and not asked_human:
+                        asked_human = True
+                        reply = mailbox_roundtrip(acc_dir.name, BASE_DIR,
+                                                  reason + "\n\n请回复本邮件，第一行写你的答复。",
+                                                  deadline, max_wait_s=1200)
+                        if reply:
+                            ai_advice(acc_dir, cfg,
+                                      f"用户对问题的回答：{reply[:200]}。原问题：{reason[:150]}。给出最终处置建议。")
                     elif act == "escalate":
                         notify_account_issue(acc_dir, cfg, last_err, reason)
                         ai_rounds = 99  # 已上报人工，停止自动决策（保持重试等恢复）
@@ -114,10 +170,9 @@ def run_account(acc_dir, dry_run=False, once=False):
 
             time.sleep(60 if err_streak > 1 else 30)
 
-        # 代码医生：运维修复与 AI 白名单决策都无法解决时，AI 接入代码级诊断/修补
-        # 触发条件：STATE_FAIL 持续且白名单决策已用尽，或异常持续且已 AI 介入过
+        # 代码医生：运维与 AI 白名单决策都无法解决时，AI 接入代码级诊断/修补
         doctor_trigger = ((state == STATE_FAIL and ai_rounds >= 3) or
-                          (state == STATE_WAIT and err_streak >= 3 and ai_marked))
+                          (state == STATE_WAIT and err_streak >= 3 and ai_rounds >= 3))
         if doctor_trigger and not doctor_done:
             doctor_done = True
             loga("[代码医生] 运维修复未奏效，AI 接入代码级诊断…")
@@ -126,9 +181,8 @@ def run_account(acc_dir, dry_run=False, once=False):
                 lr = getattr(client, "last_response", None) or {}
                 res = diagnose_and_maybe_patch(
                     f"账号{acc_dir.name}签到持续失败",
-                    {"last_response": lr, "last_fail_reason": last_fail_reason,
-                     "error_history": last_err[:300], "account": acc_dir.name,
-                     "server_time": time.strftime("%Y-%m-%d %H:%M")},
+                    {"last_response": lr, "error_history": last_err[:300],
+                     "account": acc_dir.name, "server_time": time.strftime("%Y-%m-%d %H:%M")},
                     failing_action=(lr or {}).get("action", "check.action"),
                     api_key=cfg.get("glm_api_key"),
                     app_dir=str(BASE_DIR),
@@ -139,8 +193,7 @@ def run_account(acc_dir, dry_run=False, once=False):
                                      "自动修复升级至代码级： " + res.get("notify_text", "")[:200],
                                      res.get("diagnosis", "")[:300])
                 if res.get("patched") and not dry_run:
-                    # 补丁热生效：重载模块 + 重建客户端，继续窗口内重试
-                    import importlib
+                    # 补丁热生效：重载模块 + 全局符号更新 + 重建客户端
                     import checkin as _ck
                     importlib.reload(_ck)
                     globals().update({
@@ -181,6 +234,14 @@ def run_account(acc_dir, dry_run=False, once=False):
                         if nt:
                             client = AttnClient(nt, cfg.get("base_url"), user_agent=cfg.get("user_agent"))
                             loga("[AI 处置] 已换新 token，下一轮重试")
+                    elif act == "ask_human" and not asked_human:
+                        asked_human = True
+                        reply = mailbox_roundtrip(acc_dir.name, BASE_DIR,
+                                                  reason + "\n\n请回复本邮件，第一行写你的答复。",
+                                                  deadline, max_wait_s=1200)
+                        if reply:
+                            ai_advice(acc_dir, cfg,
+                                      f"用户回答：{reply[:200]}。原问题：{reason[:150]}。给出最终处置建议。")
                     elif act == "escalate":
                         notify_account_issue(acc_dir, cfg, last_fail_reason, reason)
                         ai_rounds = 99
