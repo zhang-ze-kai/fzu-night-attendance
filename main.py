@@ -57,8 +57,8 @@ def mailbox_roundtrip(acc_dir, base_dir, question, deadline, max_wait_s=1500):
     marker = f"FDU-RQ-{acc_dir}-{int(time.time())}"
     timeout_s = int(min(max_wait_s, remaining))
     log(f"[邮箱通道] 请求邮件已发送，等待用户回复（最长 {timeout_s}s）…")
-    r = request_and_wait(ncfg, marker, question, timeout_s=timeout_s, poll_s=25,
-                         deadline_ts=deadline - 300)
+    r = request_and_wait(ncfg, marker, question[:60], question, timeout_s=timeout_s,
+                         poll_s=25, deadline_ts=deadline - 300)
     reply = (r.get("answer") or "").strip()
     log("[邮箱通道] " + ("收到回复: " + reply[:80] if reply else "超时未收到回复"))
     return reply or None
@@ -103,28 +103,50 @@ def run_account(acc_dir, dry_run=False, once=False):
                 except Exception as e2:
                     loga(f"续期失败: {e2}")
                     # 邮箱双向通道：短信墙 → 请求邮件 → 用户回复验证码 → 继续自治
+                    # 短信可能延迟/丢失：最多 2 轮，每轮 = 发短信 + 等用户回复；无码回复则重发
                     if "短信二次认证" in str(e2):
-                        code_reply = mailbox_roundtrip(
-                            acc_dir.name, BASE_DIR,
-                            f"账号 {acc_dir.name} 需要短信验证码：请回复本邮件，第一行写你手机收到的验证码。",
-                            deadline, max_wait_s=1800)
-                        if code_reply:
+                        sms_attempts, sms_ok = 0, False
+                        while sms_attempts < 2 and not sms_ok:
+                            sms_attempts += 1
+                            remaining = deadline - time.time() - 600
+                            if remaining < 120:
+                                loga(f"[邮箱通道] 窗口剩余时间不足（{int(remaining)}s）")
+                                break
+                            proc = subprocess.Popen(
+                                [sys.executable, str(BASE_DIR / "bootstrap.py"), acc_dir.name, "1800"],
+                                cwd=str(BASE_DIR),
+                                stdout=open(acc_dir / "bootstrap.log", "ab"),
+                                stderr=subprocess.STDOUT)
+                            loga(f"[邮箱通道] 第 {sms_attempts}/2 次引导已启动（短信已发），等用户回复验证码…")
+                            code_reply = mailbox_roundtrip(
+                                acc_dir.name, BASE_DIR,
+                                f"账号 {acc_dir.name} 需要短信验证码（第 {sms_attempts} 次）：请回复本邮件，第一行写你手机收到的验证码。若未收到短信请回复\"没收到\"，系统会重发。",
+                                deadline, max_wait_s=1800)
+                            if not code_reply:
+                                loga("[邮箱通道] 邮件往返超时，未收到用户回复")
+                                break
                             m = re.search(r"(\d{4,8})", code_reply.replace(" ", ""))
                             if m:
                                 (acc_dir / "sms_code.txt").write_text(m.group(1), encoding="utf-8")
-                                loga(f"[邮箱通道] 收到验证码 {m.group(1)}，运行引导…")
-                                subprocess.run([sys.executable, str(BASE_DIR / "bootstrap.py"),
-                                                acc_dir.name, "1800"], cwd=str(BASE_DIR),
-                                               timeout=2600)
+                                loga(f"[邮箱通道] 收到验证码 {m.group(1)}，等待引导完成…")
+                                try:
+                                    proc.wait(timeout=2600)
+                                except subprocess.TimeoutExpired:
+                                    proc.kill()
+                                    raise RuntimeError("bootstrap 引导超时")
                                 loga("[邮箱通道] 引导完成，重新续期…")
                                 nt = sso_cookie_refresh(cfg, str(cfg_path)) or sso_refresh(cfg, str(cfg_path))
                                 client = AttnClient(nt, cfg.get("base_url"), user_agent=cfg.get("user_agent"))
                                 notified_fail = False
-                                continue
-                        loga("[邮箱通道] 未完成验证（超时/格式不对），转人工")
+                                sms_ok = True
+                                loga("[邮箱通道] 续期成功，继续签到流程")
+                            else:
+                                loga("[邮箱通道] 回复无验证码（短信可能未到达），自动重发…")
+                        if sms_ok:
+                            continue
                         notify_account_issue(acc_dir, cfg,
-                                             f"短信验证邮件往返未成功: {str(e2)[:200]}",
-                                             "请手动打开 App 签到（22:30 前不算迟到），或重跑 bootstrap.py")
+                                             "短信验证未完成（短信未到达或超时）",
+                                             "请手动打开 App 签到（22:30 前不算迟到），或明天窗口内重试")
                         return False
                     notify_account_issue(acc_dir, cfg, f"token 续期失败: {e2}", "需人工处理")
                     return False
