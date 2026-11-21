@@ -2,42 +2,64 @@
 # -*- coding: utf-8 -*-
 """邮箱对话管家：用户随时发邮件提问 → AI 读邮件 + 查系统实时状态 → 邮件回复。
 
-由 cron 每分钟调用（/etc/cron.d/fdu-maildaemon），用 flock 防重叠。
-只处理：发件人=自己、非已处理、非系统流程邮件（排除 FDU-RQ-/FDU-AI-/FDU-TEST- 标记，
-那些是 bootstrap/主流程的交互邮件，由各自的轮询负责）。
+由 cron 每分钟调用（/etc/cron.d/fdu-maildaemon），flock 防重叠。
+
+自识别策略（重要教训：用户回复管家的邮件，主题会继承 Re:[FDU-DAEMON] 前缀，
+不能按主题子串跳过，否则用户的回复会被当成管家自己的邮件永久忽略）：
+  - 管家发出的每封回复带 Message-ID <FDU-DREP-...@fdu-mail>
+  - 扫描时 msgid 含 FDU-DREP，或主题以 [FDU-DAEMON] 开头 = 管家出站 → 跳过
+  - FDU-RQ-/FDU-AI-/FDU-TEST- 请求邮件由 bootstrap/main 各自的轮询消费，管家不碰
+
+QQ 邮箱 IMAP 实测忽略 SINCE 条件（恒返全部）→ 两段式抓取：
+先只抓头部（MESSAGE-ID/SUBJECT/DATE）分拣，候选邮件才抓全文；客户端按日期过滤。
 """
 import email
 import imaplib
 import json
-import re
 import sys
 import time
-from email.header import decode_header
 from email.mime.text import MIMEText
+from email.utils import parsedate_to_datetime
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 from mailbox import _decode, _get_text, load_notify
 
-SKIP_MARKERS = ("FDU-RQ-", "FDU-AI-", "FDU-TEST-", "FDU-DAEMON", "FDU-")
-SYSTEM_SUBJECT_PREFIX = ("晚点名签到", "晚点名签到异常")  # 系统通知邮件的主题前缀，永不当作提问
+SKIP_SUBJECT_SUBSTR = ("FDU-RQ-", "FDU-AI-", "FDU-TEST-")  # 其他流程的请求邮件
+OUTBOUND_MSGID_TAG = "FDU-DREP"                            # 管家回复的 Message-ID 标记
+OUTBOUND_SUBJECT_PREFIX = "[FDU-DAEMON]"                   # 管家回复的主题前缀
+SYSTEM_SUBJECT_PREFIX = ("晚点名签到", "晚点名签到异常")     # 系统通知邮件主题，永不当作提问
 STATE = HERE / "mail_daemon_state.json"
 API_URL = "https://open.bigmodel.cn/api/paas/v4/chat/completions"
 MODEL = "glm-5.3-flash"
 
+DAYS_BACK = 3            # 只处理最近 N 天的邮件（QQ 忽略 SINCE，靠客户端过滤）
+MAX_REPLIES_PER_RUN = 3  # 单次运行回复上限，积压分分钟消化
+REPLY_MIN_INTERVAL = 90  # 同一次运行内两封回复的最小间隔（秒）
+DAILY_REPLY_CAP = 30     # 每日回复上限（跨运行持久化，防刷屏兜底）
 
-def load_processed():
+
+def log(msg):
+    print(f"[daemon {time.strftime('%m-%d %H:%M:%S')}] {msg}", flush=True)
+
+
+def load_state():
     try:
-        return set(json.loads(STATE.read_text(encoding="utf-8")))
+        j = json.loads(STATE.read_text(encoding="utf-8"))
     except Exception:
-        return set()
+        j = {}
+    if isinstance(j, list):  # 旧格式：纯 msgid 列表
+        return {"processed": j, "day": "", "replies": 0}
+    return {"processed": j.get("processed", []),
+            "day": j.get("day", ""), "replies": int(j.get("replies", 0))}
 
 
-def save_processed(ids):
-    # 只保留 7 天内的记录，防止无限增长
-    keep = ids[-500:]
-    STATE.write_text(json.dumps(keep, ensure_ascii=False), encoding="utf-8")
+def save_state(st, processed):
+    # processed 是运行期 set（不断有新标记），落盘时以它为准；只保留最近 500 条防无限增长
+    STATE.write_text(json.dumps(
+        {"processed": list(processed)[-500:], "day": st["day"], "replies": st["replies"]},
+        ensure_ascii=False), encoding="utf-8")
 
 
 def _key():
@@ -135,11 +157,27 @@ def _answer(user_msg):
     ])
 
 
+def _hand_typed(body):
+    """提取用户手打内容：QQ 引用分隔线之后全是被引用的原始邮件，整段剔除。"""
+    head = body.split("---Original---")[0].split("-----原始邮件")[0]
+    skip_kw = ("请直接回复", "写所需内容", "第一行写", "FDU-RQ", "FDU-AI", "发自我的")
+    out = []
+    for line in head.splitlines():
+        s = line.strip()
+        if not s or s.startswith(">") or s.lower().startswith("于 "):
+            continue
+        if "写道：" in s or any(k in s for k in skip_kw):
+            continue
+        out.append(s)
+    return "\n".join(out)[:800]
+
+
 def _send_reply(cfg, subject, body):
     msg = MIMEText(body, "plain", "utf-8")
     msg["Subject"] = subject
     msg["From"] = cfg["user"]
     msg["To"] = cfg["user"]
+    msg["Message-ID"] = f"<{OUTBOUND_MSGID_TAG}-{int(time.time() * 1000)}@fdu-mail>"
     import smtplib
     smtp = smtplib.SMTP_SSL(cfg["smtp_host"], cfg["smtp_port"], timeout=25)
     try:
@@ -150,82 +188,107 @@ def _send_reply(cfg, subject, body):
 
 
 def main():
+    import datetime
     import fcntl
     lock = open("/tmp/fdu_maildaemon.lock", "w")
-    # 每日回复上限与最小间隔（防刷屏兜底）
-    replies_today = 0
-    last_reply_ts = 0.0
     try:
         fcntl.flock(lock, fcntl.LOCK_EX | fcntl.LOCK_NB)
     except Exception:
         sys.exit(0)  # 上一次轮询还没结束，跳过本轮
     cfg = _key()
-    processed = load_processed()
+    st = load_state()
+    processed = set(st["processed"])
+    today = time.strftime("%Y%m%d")
+    if st["day"] != today:  # 跨天清零每日回复计数
+        st["day"] = today
+        st["replies"] = 0
 
     imap = imaplib.IMAP4_SSL(cfg["imap_host"], cfg["imap_port"])
     imap.login(cfg["user"], cfg["code"])
     imap.select("INBOX")
-    import datetime
-    dt = datetime.datetime.now() - datetime.timedelta(days=3)
-    since = "%02d-%s-%04d" % (dt.day, ["Jan","Feb","Mar","Apr","May","Jun","Jul","Aug","Sep","Oct","Nov","Dec"][dt.month-1], dt.year)
-    # 不加 UNSEEN——RFC822 抓取会自动标读，UNSEEN 条件会让邮件永远丢失；去重靠 processed 集合
-    typ, data = imap.search(None, f'(FROM "{cfg["user"]}" SINCE "{since}")')
+    typ, data = imap.search(None, f'(FROM "{cfg["user"]}")')
     ids = (data[0] or b"").split()
-    new_count = 0
-    for eid in reversed(ids):
-        typ, md = imap.fetch(eid, "(BODY.PEEK[])")  # PEEK：不自动标读
-        raw = md[0][1]
-        msg = email.message_from_bytes(raw)
-        msgid = (msg.get("Message-ID", "") or "").strip()
-        subject = _decode(msg.get("Subject", ""))
-        if msgid in processed or any(m in subject for m in SKIP_MARKERS):
+    cutoff = time.time() - DAYS_BACK * 86400
+
+    # 第一段：只抓头部做分拣（QQ 不认 SINCE，全量靠客户端过滤）
+    candidates = []
+    dirty = False
+    for eid in ids:
+        typ, md = imap.fetch(eid, "(BODY.PEEK[HEADER.FIELDS (MESSAGE-ID SUBJECT DATE)])")
+        head = email.message_from_bytes(md[0][1])
+        msgid = (head.get("Message-ID", "") or "").strip()
+        subject = _decode(head.get("Subject", ""))
+        if msgid in processed:
+            continue
+        # 管家自己的出站邮件 → 记为已处理，永不回复
+        if OUTBOUND_MSGID_TAG in msgid or subject.startswith(OUTBOUND_SUBJECT_PREFIX):
+            processed.add(msgid)
+            dirty = True
+            continue
+        if any(m in subject for m in SKIP_SUBJECT_SUBSTR):
+            processed.add(msgid)
+            dirty = True
             continue
         if subject.startswith(SYSTEM_SUBJECT_PREFIX) or "签到异常" in subject:
-            processed.add(msgid)  # 系统通知邮件：记为已处理但不回复
+            processed.add(msgid)
+            dirty = True
             continue
-        body = _get_text(msg).strip()
-        # 用户的手打内容：剔除引用与系统提示行
-        user_msg = ""
-        for line in body.splitlines():
-            s = line.strip()
-            if not s or s.startswith(">") or s.startswith("----"):
-                continue
-            if any(k in s for k in ("请直接回复", "写所需内容", "第一行写", "FDU-RQ", "FDU-AI")):
-                continue
-            user_msg += s + "\n"
-        user_msg = user_msg.strip()[:800]
+        try:
+            ts = parsedate_to_datetime(head.get("Date")).timestamp()
+        except Exception:
+            ts = time.time()
+        if ts < cutoff:  # 老邮件（含历史遗留）直接归档，不再进入候选
+            processed.add(msgid)
+            dirty = True
+            continue
+        candidates.append((eid, msgid, subject))
+
+    # 第二段：候选邮件才抓全文（旧的在前，逐封回复）
+    last_reply_ts = 0.0
+    replies_this_run = 0
+    for eid, msgid, subject in candidates:
+        if st["replies"] >= DAILY_REPLY_CAP:
+            log("已达每日回复上限，剩余候选记为已处理")
+            processed.add(msgid)
+            dirty = True
+            continue
+        if replies_this_run >= MAX_REPLIES_PER_RUN:
+            log(f"本次运行已回复 {replies_this_run} 封，剩余候选下轮处理")
+            break
+        typ, md = imap.fetch(eid, "(BODY.PEEK[])")  # PEEK：不自动标读
+        msg = email.message_from_bytes(md[0][1])
+        user_msg = _hand_typed(_get_text(msg))
         if not user_msg:
             processed.add(msgid)
+            dirty = True
             continue
-
-        new_count += 1
-        print(f"[daemon] 处理用户邮件: {subject[:60]}")
+        log(f"处理用户邮件: {subject[:60]}")
         try:
             answer = _answer(user_msg)
         except Exception as e:
             answer = f"管家处理出错: {e}"
         reply_body = (f"你的提问：\n{user_msg}\n\n管家回复：\n{answer}\n\n"
                       f"（系统时间 {time.strftime('%m-%d %H:%M')}）")
-        import datetime
-        today = time.strftime("%Y%m%d")
-        if replies_today >= 30 or (last_reply_ts and time.time() - last_reply_ts < 90):
-            print(f"[daemon] 达到每日上限或间隔不足，跳过回复（记为已处理）")
-            processed.add(msgid)
+        if last_reply_ts and time.time() - last_reply_ts < REPLY_MIN_INTERVAL:
+            log("同轮间隔不足，本轮跳过（不标记，下轮再试）")
             continue
         try:
-            _send_reply(cfg, f"[FDU-DAEMON] Re: {subject[:70]}", reply_body)
-            print(f"[daemon] 已回复")
-            replies_today += 1
+            _send_reply(cfg, f"{OUTBOUND_SUBJECT_PREFIX} Re: {subject[:70]}", reply_body)
+            log("已回复")
+            st["replies"] += 1
+            replies_this_run += 1
             last_reply_ts = time.time()
         except Exception as e:
-            print(f"[daemon] 回复发送失败: {e}")
+            log(f"回复发送失败: {e}")
         processed.add(msgid)
-        save_processed(list(processed))  # 每封即落盘，崩溃不再重刷
+        dirty = True
+        save_state(st, processed)  # 每封即落盘，崩溃不再重刷
 
     imap.logout()
-    save_processed(list(processed))
-    if new_count:
-        print(f"[daemon] 共处理 {new_count} 封")
+    if dirty:
+        save_state(st, processed)
+    if replies_this_run:
+        log(f"本次共回复 {replies_this_run} 封")
 
 
 if __name__ == "__main__":
