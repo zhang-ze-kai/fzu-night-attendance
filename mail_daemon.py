@@ -64,11 +64,16 @@ def _glm(messages, timeout=90, max_tokens=1024):
 def _load_key(api_key=None):
     if api_key:
         return api_key
-    try:
-        cfg = json.loads((HERE / "accounts" / "832404228" / "config.json").read_text(encoding="utf-8"))
-        return cfg.get("glm_api_key")
-    except Exception:
-        return None
+    acc = HERE / "accounts"
+    if acc.exists():
+        for d in sorted(acc.iterdir()):
+            try:
+                k = json.loads((d / "config.json").read_text(encoding="utf-8")).get("glm_api_key")
+                if k:
+                    return k
+            except Exception:
+                continue
+    return None
 
 
 def _live_status():
